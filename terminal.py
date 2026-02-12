@@ -9,10 +9,11 @@ from datetime import datetime
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QLabel, QComboBox, QPushButton, 
                                QCheckBox, QTextEdit, QLineEdit, QGroupBox , 
-                               QFileDialog, QMessageBox, QMenu, QDialog, QRadioButton,
-                               QGridLayout, QInputDialog)
+                               QFileDialog, QMessageBox, QMenu, QDialog, QTabWidget, QRadioButton,
+                               QGridLayout, QInputDialog, QScrollArea)
 from PySide6.QtCore import QTimer, Qt, QObject, Signal, Slot, QThread
 from PySide6.QtGui import QAction, QTextCursor, QColor, QTextCharFormat, QFont, QActionGroup, QIcon, QPixmap
+
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -104,13 +105,23 @@ class SerialManager(QObject):
         """Pause or resume reading data from the port."""
         self.data_paused = paused
 
+class ClickableLabel(QLabel):
+    """Spetsiaalne Label, mis reageerib hiireklõpsule."""
+    clicked = Signal()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.PointingHandCursor) # Muuda kursor käekujuliseks
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+
 class UniversalTerminal(QMainWindow):
     start_serial_worker = Signal(dict)
     stop_serial_worker = Signal()
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Fox Terminal v2.2")
+        self.setWindowTitle("Fox Terminal v2.3")
         self.icon_path = resource_path("favicon.ico")
         self.setWindowIcon(QIcon(self.icon_path))
         self.resize(1000, 700)
@@ -121,6 +132,7 @@ class UniversalTerminal(QMainWindow):
         self.buffer = b""
         self.binary_log = False
         self.packet_timeout = 0.2 # Sekundit - aeg, millal loeme paketi lõppenuks
+        self.line_limit = 10000 # Vaikimisi ridade piirang
         self.eol_char = b'\n' # Paketi lõpumärk
         self.parity_map = {
             "None": serial.PARITY_NONE, "Even": serial.PARITY_EVEN, "Odd": serial.PARITY_ODD,
@@ -157,6 +169,15 @@ class UniversalTerminal(QMainWindow):
         self.buffer_flush_timer = QTimer(self)
         self.buffer_flush_timer.timeout.connect(self.check_buffer_timeout)
         self.buffer_flush_timer.start(100)
+        
+        # --- LED Indikaatorite taimerid ---
+        self.rx_timer = QTimer(self)
+        self.rx_timer.setSingleShot(True)
+        self.rx_timer.timeout.connect(self._turn_off_rx)
+        
+        self.tx_timer = QTimer(self)
+        self.tx_timer.setSingleShot(True)
+        self.tx_timer.timeout.connect(self._turn_off_tx)
 
     def setup_ui(self):
         central_widget = QWidget()
@@ -188,7 +209,9 @@ class UniversalTerminal(QMainWindow):
         file_menu = menubar.addMenu("File")
         exit_action = QAction("Exit Program ", self)
         exit_action.triggered.connect(self.close)
+        
         file_menu.addAction(exit_action)
+        
         
         # Settings menüü
         settings_menu = menubar.addMenu("Settings")
@@ -231,6 +254,28 @@ class UniversalTerminal(QMainWindow):
         self.custom_timeout_action.triggered.connect(self.ask_custom_timeout)
         timeout_menu.addAction(self.custom_timeout_action)
         timeout_group.addAction(self.custom_timeout_action)
+
+        # Line Limit menüü
+        limit_menu = settings_menu.addMenu("Line Limit")
+        limit_menu.setToolTip("Piira terminali ridade arvu jõudluse parandamiseks")
+        limit_group = QActionGroup(self)
+        self.limit_actions = {}
+
+        for limit in [1000, 2000, 5000, 10000]:
+            action = QAction(f"{limit} rida", self)
+            action.setCheckable(True)
+            action.triggered.connect(lambda checked, val=limit: self.set_line_limit(val))
+            limit_menu.addAction(action)
+            limit_group.addAction(action)
+            self.limit_actions[limit] = action
+            if limit == 10000:
+                action.setChecked(True)
+
+        self.custom_limit_action = QAction("Custom...", self)
+        self.custom_limit_action.setCheckable(True)
+        self.custom_limit_action.triggered.connect(self.ask_custom_line_limit)
+        limit_menu.addAction(self.custom_limit_action)
+        limit_group.addAction(self.custom_limit_action)
 
         # About menüü
         about_menu = menubar.addMenu("About")
@@ -295,6 +340,7 @@ class UniversalTerminal(QMainWindow):
 
         # Right side column for connect button and mode
         v_layout = QVBoxLayout()
+        
         self.connect_btn = QPushButton("Ühenda")
         self.connect_btn.setToolTip("Ava või sule ühendus valitud pordiga")
         self.connect_btn.clicked.connect(self.toggle_connection)
@@ -308,10 +354,28 @@ class UniversalTerminal(QMainWindow):
         self.mode_combo.setToolTip("Tekst: Tavaline lugemine\nHEX: Toored baidid\nJSON: Teeb andmed loetavaks\nCSV: Joondab tabelina\nModbus: Eraldab ID ja Käsu\nASCII Table: HEX ja sümbol")
         mode_layout.addWidget(self.mode_combo)
         v_layout.addLayout(mode_layout)
+        
+        # LED Indikaatorid (RX/TX)
+        led_layout = QHBoxLayout()
+        led_layout.addWidget(QLabel("RX"))
+        self.led_rx = QLabel()
+        self.led_rx.setFixedSize(16, 16)
+        led_layout.addWidget(self.led_rx)
+        led_layout.addSpacing(10)
+        led_layout.addWidget(QLabel("TX"))
+        self.led_tx = QLabel()
+        self.led_tx.setFixedSize(16, 16)
+        led_layout.addWidget(self.led_tx)
+        led_layout.addStretch()
+        v_layout.addLayout(led_layout)
+
         v_layout.addStretch()
         
         conn_layout.addLayout(v_layout, 0, 5, 3, 1) # Span all 3 rows
         conn_layout.setColumnStretch(6, 1)
+        
+        # Algväärtusta LED stiilid
+        self._reset_leds()
         
         return conn_group
 
@@ -404,6 +468,7 @@ class UniversalTerminal(QMainWindow):
     def _setup_terminal_area(self):
         self.output_area = QTextEdit()
         self.output_area.setReadOnly(True)
+        self.output_area.document().setMaximumBlockCount(self.line_limit) # Piira ridade arvu, et vältida hangumist
         font = QFont("Consolas", 10)
         self.output_area.setFont(font)
         self.main_layout.addWidget(self.output_area)
@@ -515,7 +580,8 @@ class UniversalTerminal(QMainWindow):
         now = time.time()
         is_continuation = (now - self.last_receive_time) < self.packet_timeout
         self.last_receive_time = now
-
+        self.flash_rx()
+        
         if self.is_logging and self.log_file and self.binary_log:
             self.log_file.write(chunk) 
             self.log_file.flush()
@@ -572,7 +638,7 @@ class UniversalTerminal(QMainWindow):
         if self.is_logging and self.log_file and not self.binary_log:
             ts_str = ""
             if is_new:
-                ts_str = "\n" + datetime.now().strftime("[%H:%M:%S.%f]"[:-3]) + "] "
+                ts_str = "\n" + datetime.now().strftime("[%H:%M:%S.%f]")[:-5] + "] "
             self.log_file.write(ts_str + text)
             self.log_file.flush()
 
@@ -584,7 +650,7 @@ class UniversalTerminal(QMainWindow):
             # Ajatempel
             if is_new:
                 if self.show_timestamps:
-                    ts = "\n" + datetime.now().strftime("[%H:%M:%S.%f]"[:-3]) + "] "
+                    ts = "\n" + datetime.now().strftime("[%H:%M:%S.%f]")[:-5] + "] "
                     fmt_ts = QTextCharFormat()
                     fmt_ts.setForeground(QColor("#888888")) # Hall
                     cursor.insertText(ts, fmt_ts)
@@ -611,9 +677,11 @@ class UniversalTerminal(QMainWindow):
             if self.send_as_hex:
                 self.serial_manager.write(bytes.fromhex(cmd.replace(" ", "")))
                 self.log_to_screen(f">> [HEX] {cmd}", is_new=True, tag="sent")
+                self.flash_tx()
             else:
                 self.serial_manager.write((cmd + "\r\n").encode('utf-8'))
                 self.log_to_screen(f">> {cmd}", is_new=True, tag="sent")
+                self.flash_tx()
             self.input_field.clear()
         except: QMessageBox.critical(self, "Viga", "Vale HEX formaat!")
 
@@ -625,9 +693,11 @@ class UniversalTerminal(QMainWindow):
             if self.send_as_hex:
                 self.serial_manager.write(bytes.fromhex(cmd.replace(" ", "")))
                 self.log_to_screen(f">> [HEX M{num}] {cmd}", is_new=True, tag="sent")
+                self.flash_tx()
             else:
                 self.serial_manager.write((cmd + "\r\n").encode('utf-8'))
                 self.log_to_screen(f">> [M{num}] {cmd}", is_new=True, tag="sent")
+                self.flash_tx()
         except: QMessageBox.critical(self, "Viga", "Vale HEX formaat!")
 
     def toggle_logging_file(self):
@@ -717,8 +787,25 @@ class UniversalTerminal(QMainWindow):
             else:
                 self.custom_timeout_action.setChecked(True)
 
+    def set_line_limit(self, limit):
+        self.line_limit = limit
+        if hasattr(self, 'output_area'):
+            self.output_area.document().setMaximumBlockCount(limit)
+
+    def ask_custom_line_limit(self):
+        val, ok = QInputDialog.getInt(self, "Custom Line Limit", "Sisesta ridade arv (100-100000):", value=self.line_limit, minValue=100, maxValue=100000)
+        if ok:
+            self.set_line_limit(val)
+            if val in self.limit_actions:
+                self.limit_actions[val].setChecked(True)
+        else:
+            if self.line_limit in self.limit_actions:
+                self.limit_actions[self.line_limit].setChecked(True)
+            else:
+                self.custom_limit_action.setChecked(True)
+
     def show_help(self):
-        help_text = """
+        help_text_content = """
         - Ühenduse seaded: Vali COM port, kiirus (Baud), andmebittide arv (Data Bits), paarsuskontroll (Parity), stop-bittide arv (Stop Bits) ja voo kontroll (Flow Control).
         - Ühenda: Ava või sule ühendus valitud pordiga.
         - Režiim: Tekst, HEX, JSON, CSV, Modbus, ASCII Table.
@@ -730,9 +817,107 @@ class UniversalTerminal(QMainWindow):
         - Eemalda reavahetus: Eemalda sissetuleva teksti algusest ja lõpust tühikud (sh reavahetused).
         - Packet Delimiter: Vali paketi lõpumärk (vaikimisi LF).
         - Packet Timeout: Määra aeg, millal loeme paketi lõppenuks (Custom: 10-10000 ms).
+        - Line Limit: Määra maksimaalne ridade arv terminali aknas (jõudluse hoidmiseks).
         - Saada HEX: Tõlgenda sisendit HEX koodidena (nt 41 42).
+        - Teema (Settings): Vali tume või hele kujundus.
         """
-        QMessageBox.information(self, "Abi", help_text)
+        
+        # Loome dialoogiakna
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Abi ja Pinoutid")
+        dialog.setMinimumSize(600, 500)
+        layout = QVBoxLayout(dialog)
+        
+        tabs = QTabWidget()
+        
+        # --- TAB 1: Üldine abi ---
+        tab_help = QWidget()
+        layout_help = QVBoxLayout(tab_help)
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setText(help_text_content)
+        layout_help.addWidget(text_edit)
+        tabs.addTab(tab_help, "Juhend")
+        
+        # --- TAB 2: Pinoutid ---
+        tab_pinout = QWidget()
+        layout_pinout = QVBoxLayout(tab_pinout)
+        
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        
+        content_widget = QWidget()
+        layout_content = QVBoxLayout(content_widget)
+        
+        # 1. Null Modem
+        lbl_1 = QLabel("<h3>1. Null Modem (Crossover)</h3><p>Kasutatakse kahe arvuti või DTE seadme ühendamiseks omavahel.</p>")
+        lbl_1.setTextFormat(Qt.RichText)
+        lbl_1.setWordWrap(True)
+        layout_content.addWidget(lbl_1)
+        
+        lbl_img1 = ClickableLabel()
+        lbl_img1.setToolTip("Klõpsa pildil, et vaadata täissuuruses")
+        pix1 = QPixmap(resource_path("cable_null.png"))
+        if not pix1.isNull():
+            pix1 = pix1.scaledToWidth(560, Qt.SmoothTransformation) # Mahub ilusti aknasse
+            lbl_img1.setPixmap(pix1)
+            lbl_img1.clicked.connect(lambda: self.open_full_image("cable_null.png", "Null Modem"))
+        layout_content.addWidget(lbl_img1)
+        
+        layout_content.addSpacing(20)
+
+        # 2. Straight Through
+        lbl_2 = QLabel("<h3>2. Straight Through (Otsekaabel)</h3><p>Kasutatakse arvuti ühendamiseks modemi või muu lisaseadmega (DCE).</p>")
+        lbl_2.setTextFormat(Qt.RichText)
+        lbl_2.setWordWrap(True)
+        layout_content.addWidget(lbl_2)
+        
+        lbl_img2 = ClickableLabel()
+        lbl_img2.setToolTip("Klõpsa pildil, et vaadata täissuuruses")
+        pix2 = QPixmap(resource_path("cable_straight.png"))
+        if not pix2.isNull():
+            pix2 = pix2.scaledToWidth(560, Qt.SmoothTransformation)
+            lbl_img2.setPixmap(pix2)
+            lbl_img2.clicked.connect(lambda: self.open_full_image("cable_straight.png", "Straight Through"))
+        layout_content.addWidget(lbl_img2)
+        
+        layout_content.addStretch()
+        
+        scroll.setWidget(content_widget)
+        layout_pinout.addWidget(scroll)
+        
+        tabs.addTab(tab_pinout, "Pinoutid")
+
+        layout.addWidget(tabs)
+        
+        # Sulgemise nupp
+        btn_close = QPushButton("Sulge")
+        btn_close.clicked.connect(dialog.accept)
+        layout.addWidget(btn_close)
+        
+        dialog.exec()
+
+    def open_full_image(self, image_name, title):
+        """Avab pildi eraldi aknas täissuuruses."""
+        viewer = QDialog(self)
+        viewer.setWindowTitle(title)
+        viewer.resize(800, 600)
+        
+        v_layout = QVBoxLayout(viewer)
+        
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        
+        img_label = QLabel()
+        img_label.setAlignment(Qt.AlignCenter)
+        pix = QPixmap(resource_path(image_name))
+        if not pix.isNull():
+            img_label.setPixmap(pix)
+            
+        scroll.setWidget(img_label)
+        v_layout.addWidget(scroll)
+        
+        viewer.exec()
 
     def show_credits(self):
         dialog = QDialog(self)
@@ -752,7 +937,7 @@ class UniversalTerminal(QMainWindow):
         layout.addWidget(lbl_icon)
 
         # Tekst (keskel)
-        lbl_text = QLabel("Fox Terminal v2.2\n\nKirjutatud Pythonis\nPyside6 raamistikuga\n© 2026 Fox")
+        lbl_text = QLabel("Fox Terminal v2.3\n\nKirjutatud Pythonis\nPyside6 raamistikuga\n© 2026 r.v")
         lbl_text.setAlignment(Qt.AlignCenter)
         lbl_text.setStyleSheet("font-size: 11pt; margin-top: 10px; margin-bottom: 10px;")
         layout.addWidget(lbl_text)
@@ -783,12 +968,37 @@ class UniversalTerminal(QMainWindow):
     def force_disconnect(self):
         if self.is_connected:
             self.stop_serial_worker.emit()
+            
+    # --- LED Indikaatorite loogika ---
+    def _reset_leds(self):
+        # Hall (väljas) stiil
+        off_style = "min-width: 16px; min-height: 16px; border-radius: 8px; border: 1px solid #555; background-color: #333;"
+        self.led_rx.setStyleSheet(off_style)
+        self.led_tx.setStyleSheet(off_style)
+
+    def flash_rx(self):
+        # Roheline (RX)
+        self.led_rx.setStyleSheet("min-width: 16px; min-height: 16px; border-radius: 8px; border: 1px solid #00ff00; background-color: #00e676;")
+        self.rx_timer.start(100) # 100ms pärast lülita välja (või pikenda kui uus tuleb)
+
+    def flash_tx(self):
+        # Punane (TX)
+        self.led_tx.setStyleSheet("min-width: 16px; min-height: 16px; border-radius: 8px; border: 1px solid #ff0000; background-color: #ff1744;")
+        self.tx_timer.start(100)
+
+    def _turn_off_rx(self):
+        off_style = "min-width: 16px; min-height: 16px; border-radius: 8px; border: 1px solid #555; background-color: #333;"
+        self.led_rx.setStyleSheet(off_style)
+
+    def _turn_off_tx(self):
+        off_style = "min-width: 16px; min-height: 16px; border-radius: 8px; border: 1px solid #555; background-color: #333;"
+        self.led_tx.setStyleSheet(off_style)
 
 if __name__ == "__main__":
     # See koodijupp tagab, et ikoon oleks nähtav ka Windowsi tegumiribal (Taskbar)
     try:
         import ctypes
-        myappid = 'rein.fox.terminal.2.2'
+        myappid = 'rein.fox.terminal.2.3'
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     except:
         pass # Toimib ainult Windowsis
