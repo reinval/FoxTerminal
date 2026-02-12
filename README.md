@@ -19,4 +19,5 @@ Help:
         - Packet Delimiter: Vali paketi lõpumärk (vaikimisi LF).        
         - Packet Timeout: Määra aeg, millal loeme paketi lõppenuks (Custom: 10-10000 ms).        
         - Saada HEX: Tõlgenda sisendit HEX koodidena (nt 41 42).       
-<img width="998" height="727" alt="Screenshot" src="https://github.com/user-attachments/assets/5e3fee96-3a9a-48c7-8cf7-9b1dd027b397" />
+--------------
+<img width="1120" height="767" alt="image" src="https://github.com/user-attachments/assets/c8488415-744c-4da9-a5fd-d223e1d82cf5" />
