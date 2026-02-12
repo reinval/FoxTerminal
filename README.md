@@ -6,7 +6,8 @@ Kirjutatud Pythonis
 
 Help:
 
-         - Ühenduse seaded: Vali COM port, kiirus (Baud), andmebittide arv (Data Bits), paarsuskontroll (Parity), stop-bittide arv (Stop Bits) ja voo kontroll (Flow Control).
+         - Ühenduse seaded: Vali COM port, kiirus (Baud), andmebittide arv (Data Bits),
+           paarsuskontroll (Parity), stop-bittide arv (Stop Bits) ja voo kontroll (Flow Control).
         - Ühenda: Ava või sule ühendus valitud pordiga.
         - Režiim: Tekst, HEX, JSON, CSV, Modbus, ASCII Table.
         - Ajatemplid: Näita iga uue paketi alguses kellaaega.
